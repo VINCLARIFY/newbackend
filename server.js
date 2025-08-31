@@ -11,7 +11,8 @@ app.use(express.json());
 
 // ✅ Proper CORS Setup
 const allowedOrigins = [
-  "https://vinclarify.info", // tumhari live site
+  "https://vinclarify.info",
+   "https://www.vinclarify.info", // tumhari live site
   "http://localhost:3000"    // local testing ke liye
 ];
 
