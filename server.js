@@ -12,7 +12,7 @@ app.use(express.json());
 // CORS configuration
 const allowedOrigins = [
   "https://vinclarify.info", // your live site
-  "http://localhost:3000",   // local development
+  "https://www.vinclarify.info", // tumhari live site   // local development
   "http://127.0.0.1:5500"    // common local server port
 ];
 
