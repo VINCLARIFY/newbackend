@@ -18,8 +18,8 @@ app.use(morgan(process.env.NODE_ENV === "production" ? "tiny" : "dev"));
 const allowedOrigins = new Set([
   "https://vinclarify.info",
   "https://www.vinclarify.info",
-  "http://127.0.0.1:5500",
-  "http://localhost:3000",
+  "https://homielife.com",
+  "https://www.homielife.com",
   "http://localhost:5173",
 ]);
 
