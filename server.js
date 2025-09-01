@@ -15,33 +15,35 @@ app.use(helmet({ crossOriginResourcePolicy: false }));
 app.use(morgan(process.env.NODE_ENV === "production" ? "tiny" : "dev"));
 
 // ---- CORS ----
-const allowedOrigins = [
+const allowedOrigins = new Set([
   "https://vinclarify.info",
   "https://www.vinclarify.info",
   "https://homielife.com",
   "https://www.homielife.com",
   "http://localhost:5173",
-  "http://localhost:3000"
-];
+]);
 
-app.use(cors({
-  origin: function (origin, callback) {
-    // Allow requests with no origin (like mobile apps, curl, postman)
-    if (!origin) return callback(null, true);
-    
-    if (allowedOrigins.indexOf(origin) !== -1) {
-      callback(null, true);
-    } else {
-      console.log(`CORS blocked for origin: ${origin}`);
-      callback(new Error(`Not allowed by CORS: ${origin}`), false);
-    }
-  },
-  credentials: true,
-  methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-  allowedHeaders: ["Content-Type", "Authorization", "X-Requested-With"]
-}));
+app.use(
+  cors({
+    origin(origin, cb) {
+      // allow non-browser clients or same-origin
+      if (!origin || allowedOrigins.has(origin)) return cb(null, true);
+      return cb(new Error(`Not allowed by CORS: ${origin}`));
+    },
+    methods: ["GET", "POST", "OPTIONS"],
+    allowedHeaders: [
+      "Content-Type",
+      "Authorization",
+      "X-Requested-With",
+      "Accept",
+      "Origin",
+    ],
+    credentials: true,
+    maxAge: 86400,
+  })
+);
 
-// Handle preflight requests
+// Preflight
 app.options("*", cors());
 
 // ======================= AIRWALLEX CONFIG =======================
@@ -49,38 +51,12 @@ const ENV = process.env.NODE_ENV || "development";
 const AIRWALLEX_API_BASE =
   ENV === "production" ? "https://api.airwallex.com" : "https://api-demo.airwallex.com";
 
-// axios instance with better error handling
+// safety: single axios instance
 const ax = axios.create({
   baseURL: AIRWALLEX_API_BASE,
-  timeout: 30000,
+  timeout: 15000, // 15s
   headers: { "Content-Type": "application/json" },
 });
-
-// Add response interceptor for better error handling
-ax.interceptors.response.use(
-  (response) => response,
-  (error) => {
-    if (error.code === 'ECONNABORTED') {
-      console.error('Airwallex API request timeout');
-      return Promise.reject(new Error('Request timeout with payment provider'));
-    }
-    
-    // Log detailed error information
-    if (error.response) {
-      console.error('Airwallex API Error:', {
-        status: error.response.status,
-        data: error.response.data,
-        headers: error.response.headers
-      });
-    } else if (error.request) {
-      console.error('Airwallex API No Response:', error.request);
-    } else {
-      console.error('Airwallex API Error:', error.message);
-    }
-    
-    return Promise.reject(error);
-  }
-);
 
 // ======================= HELPERS =======================
 function assertEnv() {
@@ -95,50 +71,30 @@ function assertEnv() {
 function normalizeAmount(amount) {
   const n = Number(amount);
   if (!Number.isFinite(n) || n <= 0) return null;
-  // Convert to cents for Airwallex
-  return Math.round(n * 100);
+  // Airwallex expects amount in **major units** (e.g., 12.34). Your UI sends whole dollars?
+  // If your price is 29 -> keep 29. If you ever send cents, round to 2 decimals:
+  return Math.round(n * 100) / 100;
 }
 
 function requestId(prefix = "vin") {
   return `${prefix}_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
 }
 
-// ---- Get Airwallex authentication token ----
+// ---- Get Airwallex authentication token (FIXED) ----
 async function getAirwallexToken() {
   assertEnv();
   try {
-    const authString = Buffer.from(
-      `${process.env.AIRWALLEX_CLIENT_ID}:${process.env.AIRWALLEX_API_KEY}`
-    ).toString('base64');
-
-    const response = await ax.post("/api/v1/authentication/login", {}, {
-      headers: {
-        'Authorization': `Basic ${authString}`,
-        'Content-Type': 'application/json'
-      }
+    const { data } = await ax.post("/api/v1/authentication/login", {
+      client_id: process.env.AIRWALLEX_CLIENT_ID,
+      api_key: process.env.AIRWALLEX_API_KEY,
     });
-    
-    if (!response.data?.token) {
-      throw new Error("Missing token in Airwallex response");
-    }
-    
-    return response.data.token;
+    if (!data?.token) throw new Error("Missing token in Airwallex response");
+    return data.token;
   } catch (err) {
-    console.error("Airwallex auth error details:", {
-      message: err.message,
-      status: err.response?.status,
-      data: err.response?.data
-    });
-    
-    if (err.response?.status === 401) {
-      throw new Error("Invalid Airwallex credentials. Please check your CLIENT_ID and API_KEY.");
-    } else if (err.response?.status >= 500) {
-      throw new Error("Payment service temporarily unavailable. Please try again later.");
-    } else if (err.message.includes("timeout")) {
-      throw new Error("Connection to payment provider timed out.");
-    } else {
-      throw new Error(`Failed to authenticate with payment provider: ${err.message}`);
-    }
+    const code = err.response?.status;
+    const body = err.response?.data;
+    console.error("Airwallex auth error:", code, body || err.message);
+    throw Object.assign(new Error("Payment service unavailable"), { cause: err });
   }
 }
 
@@ -167,28 +123,13 @@ app.get("/health", (req, res) => {
 // ---- Create Payment Intent ----
 app.post("/create-payment-intent", async (req, res) => {
   try {
-    console.log("Received request to create payment intent:", {
-      body: req.body,
-      headers: req.headers,
-      origin: req.headers.origin
-    });
-
     const { amount, currency = "USD", orderId } = req.body || {};
 
-    if (!amount || !orderId) {
-      console.error("Missing required fields:", { amount, orderId });
-      return res.status(400).json({
-        success: false,
-        error: "Amount and orderId are required",
-      });
-    }
-
     const amt = normalizeAmount(amount);
-    if (!amt || amt <= 0) {
-      console.error("Invalid amount:", amount);
+    if (!amt || !orderId) {
       return res.status(400).json({
         success: false,
-        error: "Valid amount (> 0) is required",
+        error: "Valid amount (> 0) and orderId are required",
       });
     }
 
@@ -211,89 +152,140 @@ app.post("/create-payment-intent", async (req, res) => {
       },
     };
 
-    console.log("Creating payment intent with payload:", payload);
-    
-    const response = await ax.post("/api/v1/pa/payment_intents/create", payload, {
-      headers: { 
-        Authorization: `Bearer ${token}`,
-        'Content-Type': 'application/json'
-      },
-    });
-
-    console.log("Payment intent created successfully:", {
-      id: response.data.id,
-      status: response.data.status
+    const { data } = await ax.post("/api/v1/pa/payment_intents/create", payload, {
+      headers: { Authorization: `Bearer ${token}` },
     });
 
     return res.json({
       success: true,
-      id: response.data.id,
-      client_secret: response.data.client_secret,
-      status: response.data.status,
-      amount: response.data.amount,
-      currency: response.data.currency,
+      id: data.id,
+      client_secret: data.client_secret,
+      status: data.status,
+      amount: data.amount,
+      currency: data.currency,
     });
   } catch (err) {
-    console.error("Payment intent creation error:", {
-      message: err.message,
-      stack: err.stack,
-      response: err.response?.data
-    });
-    
-    let statusCode = 500;
-    let errorMessage = "Failed to create payment intent";
-    
-    if (err.message.includes("credentials") || err.message.includes("Unauthorized")) {
-      statusCode = 500;
-      errorMessage = "Payment configuration error. Please check your API credentials.";
-    } else if (err.message.includes("temporarily unavailable")) {
-      statusCode = 503;
-      errorMessage = "Payment service temporarily unavailable. Please try again later.";
-    } else if (err.message.includes("timeout")) {
-      statusCode = 504;
-      errorMessage = "Payment provider timeout. Please try again.";
+    const code = err.response?.status || 500;
+    const body = err.response?.data;
+    if (ENV !== "production") {
+      console.error("Payment intent error:", code, body || err.message);
+    } else {
+      console.error("Payment intent error:", code);
     }
-    
-    res.status(statusCode).json({
+    const map =
+      code === 401
+        ? "Authentication failed with payment provider"
+        : code === 400
+        ? "Invalid payment request"
+        : "Failed to create payment";
+    res.status(500).json({
       success: false,
-      error: errorMessage,
-      details: ENV !== "production" ? err.message : undefined,
+      error: map,
+      ...(ENV !== "production" ? { details: body || err.message } : {}),
     });
   }
 });
 
-// ======================= ERROR HANDLING MIDDLEWARE =======================
-app.use((error, req, res, next) => {
-  console.error('Unhandled error:', error);
-  res.status(500).json({
-    success: false,
-    error: 'Internal server error',
-    details: ENV !== 'production' ? error.message : undefined
-  });
+// ---- Confirm Payment (if you’re confirming server-side) ----
+app.post("/confirm-payment", async (req, res) => {
+  try {
+    const { paymentIntentId, paymentMethodId } = req.body || {};
+    if (!paymentIntentId || !paymentMethodId) {
+      return res.status(400).json({
+        success: false,
+        error: "paymentIntentId and paymentMethodId are required",
+      });
+    }
+
+    const token = await getAirwallexToken();
+    const payload = { payment_method: { id: paymentMethodId } };
+
+    const { data } = await ax.post(
+      `/api/v1/pa/payment_intents/${encodeURIComponent(paymentIntentId)}/confirm`,
+      payload,
+      { headers: { Authorization: `Bearer ${token}` } }
+    );
+
+    res.json({ success: true, status: data.status, paymentIntent: data });
+  } catch (err) {
+    const code = err.response?.status || 500;
+    const body = err.response?.data;
+    if (ENV !== "production") {
+      console.error("Payment confirmation error:", code, body || err.message);
+    } else {
+      console.error("Payment confirmation error:", code);
+    }
+    const map =
+      code === 404
+        ? "Payment intent not found"
+        : code === 402
+        ? "Payment failed - please check your payment details"
+        : "Failed to confirm payment";
+    res.status(500).json({
+      success: false,
+      error: map,
+      ...(ENV !== "production" ? { details: body || err.message } : {}),
+    });
+  }
 });
 
-// 404 handler
+// ---- Get Payment Status ----
+app.get("/payment-status/:id", async (req, res) => {
+  try {
+    const id = req.params.id?.trim();
+    if (!id) return res.status(400).json({ success: false, error: "Payment ID required" });
+
+    const token = await getAirwallexToken();
+    const { data } = await ax.get(`/api/v1/pa/payment_intents/${encodeURIComponent(id)}`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+
+    res.json({
+      success: true,
+      status: data.status,
+      amount: data.amount,
+      currency: data.currency,
+      customer_id: data.customer_id,
+      merchant_order_id: data.merchant_order_id,
+    });
+  } catch (err) {
+    const code = err.response?.status || 500;
+    const body = err.response?.data;
+    if (ENV !== "production") {
+      console.error("Status check error:", code, body || err.message);
+    } else {
+      console.error("Status check error:", code);
+    }
+    res.status(500).json({ success: false, error: "Failed to get payment status" });
+  }
+});
+
+// ---- Webhook (optional; add signature verification before using in prod) ----
+app.post("/webhooks/payment-events", (req, res) => {
+  try {
+    console.log("Received payment event:", req.body?.type, req.body?.id);
+    res.json({ received: true });
+  } catch (e) {
+    console.error("Webhook error:", e);
+    res.status(400).json({ error: "Webhook handler failed" });
+  }
+});
+
+// ---- 404 ----
 app.use((req, res) => {
-  res.status(404).json({
-    success: false,
-    error: 'Endpoint not found'
-  });
+  res.status(404).json({ success: false, error: "Endpoint not found" });
+});
+
+// ---- GLOBAL ERROR ----
+app.use((err, req, res, next) => {
+  console.error("Unhandled error:", err);
+  res.status(500).json({ success: false, error: "Internal server error" });
 });
 
 // ======================= SERVER STARTUP =======================
 const PORT = Number(process.env.PORT) || 5000;
-app.listen(PORT, "0.0.0.0", () => {
+app.listen(PORT, () => {
   console.log(`🚀 Payment processor running on port ${PORT}`);
   console.log(`Environment: ${ENV}`);
   console.log(`Airwallex API: ${AIRWALLEX_API_BASE}`);
-  console.log(`Allowed origins: ${allowedOrigins.join(', ')}`);
-  
-  // Test that required environment variables are set
-  try {
-    assertEnv();
-    console.log("✓ Environment variables are properly configured");
-  } catch (err) {
-    console.error("✗ Missing environment variables:", err.message);
-    console.error("Please check your AIRWALLEX_CLIENT_ID and AIRWALLEX_API_KEY environment variables");
-  }
 });
