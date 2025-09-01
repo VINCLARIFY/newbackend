@@ -15,40 +15,33 @@ app.use(helmet({ crossOriginResourcePolicy: false }));
 app.use(morgan(process.env.NODE_ENV === "production" ? "tiny" : "dev"));
 
 // ---- CORS ----
-const allowedOrigins = new Set([
+const allowedOrigins = [
   "https://vinclarify.info",
   "https://www.vinclarify.info",
   "https://homielife.com",
   "https://www.homielife.com",
   "http://localhost:5173",
-  "http://localhost:3000",
-]);
+  "http://localhost:3000"
+];
 
-app.use(
-  cors({
-    origin: function (origin, callback) {
-      if (!origin) return callback(null, true);
-      if (allowedOrigins.has(origin)) {
-        return callback(null, true);
-      } else {
-        console.log(`CORS blocked for origin: ${origin}`);
-        return callback(new Error(`Not allowed by CORS: ${origin}`), false);
-      }
-    },
-    methods: ["GET", "POST", "OPTIONS"],
-    allowedHeaders: [
-      "Content-Type",
-      "Authorization",
-      "X-Requested-With",
-      "Accept",
-      "Origin",
-    ],
-    credentials: true,
-    maxAge: 86400,
-  })
-);
+app.use(cors({
+  origin: function (origin, callback) {
+    // Allow requests with no origin (like mobile apps, curl, postman)
+    if (!origin) return callback(null, true);
+    
+    if (allowedOrigins.indexOf(origin) !== -1) {
+      callback(null, true);
+    } else {
+      console.log(`CORS blocked for origin: ${origin}`);
+      callback(new Error(`Not allowed by CORS: ${origin}`), false);
+    }
+  },
+  credentials: true,
+  methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization", "X-Requested-With"]
+}));
 
-// Preflight
+// Handle preflight requests
 app.options("*", cors());
 
 // ======================= AIRWALLEX CONFIG =======================
@@ -176,7 +169,8 @@ app.post("/create-payment-intent", async (req, res) => {
   try {
     console.log("Received request to create payment intent:", {
       body: req.body,
-      headers: req.headers
+      headers: req.headers,
+      origin: req.headers.origin
     });
 
     const { amount, currency = "USD", orderId } = req.body || {};
@@ -278,12 +272,21 @@ app.use((error, req, res, next) => {
   });
 });
 
+// 404 handler
+app.use((req, res) => {
+  res.status(404).json({
+    success: false,
+    error: 'Endpoint not found'
+  });
+});
+
 // ======================= SERVER STARTUP =======================
 const PORT = Number(process.env.PORT) || 5000;
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`🚀 Payment processor running on port ${PORT}`);
   console.log(`Environment: ${ENV}`);
   console.log(`Airwallex API: ${AIRWALLEX_API_BASE}`);
+  console.log(`Allowed origins: ${allowedOrigins.join(', ')}`);
   
   // Test that required environment variables are set
   try {
